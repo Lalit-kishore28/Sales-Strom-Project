@@ -1,0 +1,83 @@
+openapi: 3.0.3
+info: {title: SALESTORM API, version: 1.0.0}
+servers: [{url: https://api.salestorm.example/v1}]
+security: [{bearerAuth: []}]
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    IdemKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, format: uuid}}
+  schemas:
+    Error: {type: object, properties: {code: {type: string}, message: {type: string}, traceId: {type: string}}}
+    Reservation:
+      type: object
+      properties:
+        reservationId: {type: string, format: uuid}
+        status: {type: string, enum: [RESERVED, PAYMENT_PENDING, PAYMENT_FAILED, CONFIRMED, SOLD, RELEASED]}
+        expiresAt: {type: string, format: date-time}
+    Order:
+      type: object
+      properties:
+        orderId: {type: string, format: uuid}
+        status: {type: string, enum: [CREATED, PAYMENT_PENDING, CONFIRMED, PROCESSING, SHIPPED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED]}
+        total: {type: number}
+  responses:
+    Unauthorized: {description: Missing/invalid token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    TooMany: {description: Rate limited (Retry-After header), content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+paths:
+  /products/{productId}:
+    get:
+      summary: Product details and stock status (cached, eventually consistent)
+      security: []
+      parameters: [{name: productId, in: path, required: true, schema: {type: integer}}]
+      responses:
+        '200': {description: OK}
+        '404': {description: Not found}
+  /cart/items:
+    post:
+      summary: Add item to cart
+      requestBody: {content: {application/json: {schema: {type: object, required: [productId, qty], properties: {productId: {type: integer}, qty: {type: integer, minimum: 1, maximum: 1}}}}}}
+      responses: {'200': {description: OK}, '401': {$ref: '#/components/responses/Unauthorized'}, '422': {description: Validation error}}
+  /reservations:
+    post:
+      summary: Buy Now - reserve one unit
+      parameters: [{$ref: '#/components/parameters/IdemKey'}]
+      requestBody: {content: {application/json: {schema: {type: object, required: [saleId, productId], properties: {saleId: {type: integer}, productId: {type: integer}}}}}}
+      responses:
+        '201': {description: Reserved, content: {application/json: {schema: {$ref: '#/components/schemas/Reservation'}}}}
+        '200': {description: Duplicate request - original reservation returned}
+        '409': {description: "SOLD_OUT or LIMIT_REACHED"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooMany'}
+        '503': {description: Temporarily unavailable (retry with same key)}
+  /reservations/{id}:
+    get:
+      summary: Reservation status
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Reservation'}}}}, '404': {description: Not found}}
+  /payments:
+    post:
+      summary: Pay for a reservation
+      parameters: [{$ref: '#/components/parameters/IdemKey'}]
+      requestBody: {content: {application/json: {schema: {type: object, required: [reservationId, paymentToken], properties: {reservationId: {type: string, format: uuid}, paymentToken: {type: string, description: Gateway-issued token, no card data}}}}}}
+      responses:
+        '200': {description: PAID}
+        '202': {description: PROCESSING (gateway timeout; result via polling/webhook)}
+        '402': {description: Payment failed; reservation released}
+        '410': {description: Reservation expired}
+        '409': {description: Payment already exists (same result returned if same key)}
+  /payments/webhook:
+    post:
+      summary: Gateway callback (signature-verified, idempotent by txn ref)
+      security: []
+      responses: {'200': {description: Accepted}, '401': {description: Bad signature}}
+  /orders/{orderId}:
+    get:
+      summary: Order status and tracking
+      parameters: [{name: orderId, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Order'}}}}, '404': {description: Not found}}
+  /orders/{orderId}/cancel:
+    post:
+      summary: Cancel before PROCESSING (triggers refund)
+      parameters: [{name: orderId, in: path, required: true, schema: {type: string, format: uuid}}, {$ref: '#/components/parameters/IdemKey'}]
+      responses: {'200': {description: Cancelled}, '409': {description: Not cancellable in current state}}
